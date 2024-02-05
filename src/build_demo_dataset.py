@@ -1,5 +1,6 @@
 import os
 import tiktoken
+import requests
 import hashlib
 from peft import AutoPeftModelForCausalLM
 import pandas as pd
@@ -29,6 +30,7 @@ OPENAI_CLIENT = OpenAI(api_key=OPENAI_KEY)
 GPT3 = "gpt-3.5-turbo-1106"
 GPT4 = "gpt-4-1106-preview"
 MIXTRAL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+MISTRAL = "mistralai/Mistral-7B-Instruct-v0.2"
 
 CATEGORIES = [
     "seat_comfort",
@@ -63,26 +65,31 @@ def run_gpt(user_prompt, model, temperature=0.3):
     return output
 
 
-def run_mixtral(user_prompt, temperature=0.1):
+def run_mixtral(user_prompt, model, temperature=0.1):
     model_kwargs = {"temperature": temperature}
     user_prompt = user_prompt[:3700]
 
-    chat_completion = TOGETHER_CLIENT.chat.completions.create(
-        messages=[
-            {"role": "user", "content": user_prompt},
-        ],
-        model=MIXTRAL,
-        **model_kwargs,
-    )
-    output = chat_completion.choices[0].message.content
+    try:
+        chat_completion = TOGETHER_CLIENT.chat.completions.create(
+            messages=[
+                {"role": "user", "content": user_prompt},
+            ],
+            # model=MIXTRAL,
+            model=model,
+            **model_kwargs,
+        )
+        output = chat_completion.choices[0].message.content
+    except Exception as e:
+        print(f"Oh no! exception {e} for review {user_prompt}")
+        output = ""
     return output
 
 
 def llm(prompt, model):
     if model in [GPT3, GPT4]:
         output = run_gpt(prompt, model)
-    elif model == MIXTRAL:
-        output = run_mixtral(prompt)
+    elif model in [MIXTRAL, MISTRAL]:
+        output = run_mixtral(prompt, model)
     else:
         raise Exception(f"Invalid Model {model}")
     return output
@@ -135,7 +142,6 @@ def tag_prompt_template(review):
     return f"""Here's a customer review for an experience they had on an airline.
 For each of the following categories decide if the customer's sentiment is Positive, Negative, or Neutral.
 If the category is not mentioned, return "N/A".
-The intended airline is Untied Airlines.
 
 Return using ONLY the following output schema.
 - seat_comfort: <sentiment>
@@ -154,15 +160,16 @@ Output: """
 
 def run_model_sim(reviews, model):
     records = []
-    for obs in tqdm(reviews.to_records(index=False)):
-        cid, review = obs[0], obs[1]
+    for obs in tqdm(reviews.to_dict(orient='records')):
+        cid, review = obs['cid'], obs['Review']
         prompt = tag_prompt_template(review)
         output = llm(prompt, model)
         category_predictions = parse_output(output, CATEGORIES)
-        records += [
-            {"cid": cid, "category": category_name, f"{model}_pred": sentiment}
-            for category_name, sentiment in category_predictions.items()
-        ]
+        category_predictions = {
+            key + "_pred": value for key, value in category_predictions.items()
+        }
+        category_predictions["cid"] = cid
+        records.append(category_predictions)
 
     review_df = pd.DataFrame.from_records(records)
     return review_df
@@ -216,19 +223,22 @@ def run_inference_small_model(df):
     )
     outputs = pipe(prompts, batch_size=16)
     sentiment = [x.split("<|assistant|>")[-1].split("\n") for x in outputs]
-    df['small_model_predictions'] = sentiment
-    df.to_csv('predictions.csv', index=False)
-
-
-def main(models=[GPT3, GPT4, MIXTRAL]):
-    """Generate Outputs for GPT4, GPT3, and Mixtral"""
-    df = load_sample_scrape()
-    reviews = df[["cid", "review"]].drop_duplicates()  # {id: review}
-    for model in models:
-        predictions = run_model_sim(reviews, model)
-        df = pd.merge(df, predictions, on=["cid", "category"], how="inner")
-
+    df["small_model_predictions"] = sentiment
     df.to_csv("predictions.csv", index=False)
+
+
+def main(models=[GPT3]):
+    """Generate Outputs for GPT4, GPT3, and Mixtral"""
+    # df = load_sample_scrape()
+    df = pd.read_csv("Airline_review.csv").iloc[6000:8000]
+    df["cid"] = df["Review"].apply(lambda x: _make_cid(x))
+    # reviews = df[["cid", "Review",]].drop_duplicates()  # {id: review}
+    # reviews.columns = ["cid", "review"]
+    for model in models:
+        predictions = run_model_sim(df, model)
+        df = pd.merge(df, predictions, on=["cid"], how="inner")
+
+    df.to_csv("human_labeled_data.csv", index=False)
 
 
 if __name__ == "__main__":
