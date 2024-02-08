@@ -3,12 +3,12 @@ import os
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
+from ppi_py import ppi_mean_ci, classical_mean_ci
 import pandas as pd
 import seaborn as sns
 import streamlit as st
 from openai import OpenAI
-from src.util import load_human_labeled_data, draft_report, stream_data
-from src.ppi import calculate_ppi
+from src.util import load_human_labeled_data, draft_report, stream_data, llm
 
 
 
@@ -22,11 +22,8 @@ CATEGORIES = [
     "wifi_and_connectivity",
     "value_for_money",
 ]
-TOGETHER_API_KEY = os.environ["TOGETHER_API_KEY"]
 
 st.title("Airline Open Source LLM Demo")
-
-client = OpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz")
 
 if "openai_model" not in st.session_state:
     st.session_state["openai_model"] = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -39,26 +36,28 @@ tab1, tab2, tab3 = st.tabs(
 )
 
 with tab1:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    temp_prompt = """Here's a customer review for an experience they had on an airline.
+For each of the following categories decide if the customer's sentiment is Positive, Negative, or Neutral.
+If a category is not mentioned return "N/A".
 
-    if prompt := st.chat_input("Message the bot..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+Return using ONLY the following output schema.
+- seat_comfort: <sentiment>
+- cabin_staff_service: <sentiment>
+- food_and_beverages: <sentiment>
+- inflight_entertainment: <sentiment>
+- ground_service: <sentiment>
+- wifi_and_connectivity: <sentiment>
+- value_for_money: <sentiment>
 
-        with st.chat_message("assistant"):
-            stream = client.chat.completions.create(
-                model=st.session_state["openai_model"],
-                messages=[
-                    {"role": m["role"], "content": m["content"]}
-                    for m in st.session_state.messages
-                ],
-                stream=True,
-            )
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+Return only in the above format."""
+    tab1_form = st.form(key='classifier')
+    prompt = tab1_form.text_area('Prompt', value=temp_prompt)
+    tab1_submit = tab1_form.form_submit_button('Run Prompt')
+
+    if tab1_submit:
+        output = llm(prompt)
+        streamed_output = stream_data(output)
+        st.write(streamed_output)
 
 
 with tab2:
@@ -70,39 +69,37 @@ with tab2:
         lambda x: 1 if x == "Positive" else (0 if x == "Negative" else np.nan)
     )
 
-    form = st.form(key="Preferences")
-    category = form.radio(
+    tab2_form = st.form(key="Preferences")
+    category = tab2_form.radio(
         "Select category to study...",
         CATEGORIES,
     )
-    submit = form.form_submit_button("Run Inference")
+    tab2_submit = tab2_form.form_submit_button("Run Inference")
 
-    if submit:
+    if tab2_submit:
         category_df = hf_df[
             (~hf_df[category].isna()) & (~hf_df[f"{category}_pred"].isna())
-        ].sample(250, replace=False)
+        ].sample(250, replace=False, random_state=433)
         y_labeled = category_df[category].to_numpy()
         yhat_labeled = category_df[f"{category}_pred"].to_numpy()
         category_pred_df = pred_df[(pred_df["categoy"] == category) & (~pred_df.model_prediction.isna())]
         yhat_unlabeled =  category_pred_df.sample(frac=1, replace=False)["model_prediction"].to_numpy()
 
         # sns.set_theme(style='white', font_scale=1.5, font="DejaVu Sans")
-        ci, ci_classical, ci_imputed, ns = calculate_ppi(
-            y_labeled, yhat_labeled, yhat_unlabeled, alpha=0.05, num_trials=100
+        avg_ci = ppi_mean_ci(
+            y_labeled, yhat_labeled, yhat_unlabeled, alpha=0.05
         )
-        avg_ci = ci.mean(axis=0)[-1]
-        avg_ci_classical = ci_classical.mean(axis=0)[-1]
+        avg_ci_classical = classical_mean_ci(y_labeled)
+        ci_imputed = classical_mean_ci(yhat_unlabeled)
 
         x_lim_ci_min = min(avg_ci[0], avg_ci_classical[0], ci_imputed[0]) * 0.9
         x_lim_ci_max = max(avg_ci[1], avg_ci_classical[1], ci_imputed[1]) * 1.1
 
-        y_lim_trial_max = max((ci_classical.mean(axis=0)[:, 1] - ci_classical.mean(axis=0)[:, 0])[2:]) * 1.1
-
         # ylim_trials = min()
-        fig, axs = plt.subplots(nrows=1, ncols=2, figsize=(13, 3))
+        fig, axs = plt.subplots(nrows=1, ncols=1, figsize=(13, 3))
 
         # Intervals
-        axs[1].plot(
+        axs.plot(
             avg_ci,
             [0.4, 0.4],
             linewidth=20,
@@ -115,7 +112,7 @@ with tab2:
             label=" prediction-powered",
             solid_capstyle="butt",
         )
-        axs[1].plot(
+        axs.plot(
             avg_ci_classical,
             [0.25, 0.25],
             linewidth=20,
@@ -128,7 +125,7 @@ with tab2:
             label=" classical",
             solid_capstyle="butt",
         )
-        axs[1].plot(
+        axs.plot(
             ci_imputed,
             [0.1, 0.1],
             linewidth=20,
@@ -142,36 +139,15 @@ with tab2:
             solid_capstyle="butt",
         )
         # axs[1].axvline(0.3, ymin=0.0, ymax=1, linestyle="dotted", linewidth=3, label="reported election result", color="#F7AE7C")
-        axs[1].set_xlabel(f"Percent Happy for {category}")
-        axs[1].set_yticks([])
-        axs[1].set_yticklabels([])
-        axs[1].xaxis.set_tick_params()
-        axs[1].set_ylim([0, 0.5])
-        axs[1].set_xlim([x_lim_ci_min, x_lim_ci_max])
-        axs[1].locator_params(nbins=3)
-        axs[1].legend(borderpad=1, labelspacing=1, bbox_to_anchor=(1, 1))
-        sns.despine(ax=axs[1], top=True, right=True, left=True)
-
-        # Lines
-        axs[0].plot(
-            ns,
-            ci.mean(axis=0)[:, 1] - ci.mean(axis=0)[:, 0],
-            label="prediction-powered",
-            color="#71D26F",
-            linewidth=3,
-        )
-        axs[0].plot(
-            ns,
-            ci_classical.mean(axis=0)[:, 1] - ci_classical.mean(axis=0)[:, 0],
-            label="classical",
-            color="#BFB9B9",
-            linewidth=3,
-        )
-        axs[0].locator_params(axis="y", tight=None, nbins=6)
-        axs[0].set_ylabel("width")
-        axs[0].set_xlabel("n")
-        axs[0].set_ylim([0, y_lim_trial_max])
-        sns.despine(ax=axs[0], top=True, right=True)
+        axs.set_xlabel(f"Percent Happy for {category}")
+        axs.set_yticks([])
+        axs.set_yticklabels([])
+        axs.xaxis.set_tick_params()
+        axs.set_ylim([0, 0.5])
+        axs.set_xlim([x_lim_ci_min, x_lim_ci_max])
+        axs.locator_params(nbins=3)
+        axs.legend(borderpad=1, labelspacing=1, bbox_to_anchor=(1, 1))
+        sns.despine(ax=axs, top=True, right=True, left=True)
         plt.tight_layout()
 
         st.pyplot(fig)
@@ -179,21 +155,21 @@ with tab2:
 
 with tab3:
     hf_df = load_human_labeled_data()
-    form = st.form(key="Produce a report")
-    category = form.radio(
+    tab3_form = st.form(key="Produce a report")
+    category = tab3_form.radio(
         "Select category...",
         CATEGORIES,
     )
 
-    sentiment = form.radio(
+    sentiment = tab3_form.radio(
         "Select sentiment...",
         ['Positive', 'Negative'],
     )
 
-    num_examples = form.slider('Number of examples', min_value=10, max_value=100)
-    submit = form.form_submit_button("Generate Report")
+    num_examples = tab3_form.slider('Number of examples', min_value=10, max_value=100)
+    tab3_submit = tab3_form.form_submit_button("Generate Report")
 
-    if submit:
+    if tab3_submit:
         sentiment = 1 if sentiment == 'Positive' else 0
         report = draft_report(hf_df, category, sentiment, num_examples)
         output = stream_data(report)

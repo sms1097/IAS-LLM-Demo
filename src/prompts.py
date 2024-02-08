@@ -1,4 +1,3 @@
-
 problem_extraction_prompt_template = lambda review, category, sentiment: f"""This customer had a {sentiment} experience regarding {category}.
 In less than 10 words describe the problem related to {category}.
 

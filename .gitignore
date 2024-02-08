@@ -4,3 +4,4 @@
 *.csv
 *.zip
 **pycache**
+sample_reviews.txt
